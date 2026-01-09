@@ -23,9 +23,9 @@ from tqdm import tqdm
 
 # Edit these paths as needed
 DATASET_PATHS = [
-    "./lance_dataset_0",
-    "./lance_dataset_1",
-    "./lance_dataset_2",
+    "file+uring:///var/data/one/dataset.lance",
+    "file+uring:///var/data/two/dataset.lance",
+    "file+uring:///var/data/three/dataset.lance",
 ]
 
 # Dataset parameters
@@ -39,8 +39,8 @@ NUM_PARTITIONS = 256
 NUM_SUB_VECTORS = 48  # 768 / 48 = 16 dimensions per subvector
 
 # Query parameters
-NUM_QUERIES = 2000
-NUM_WORKERS = 8
+NUM_QUERIES = 20000
+NUM_WORKERS = 256
 
 # Query search parameters
 QUERY_K = 50  # Top K results
@@ -232,8 +232,9 @@ def run_queries(
         # Collect results with progress bar
         with tqdm(total=len(futures), desc=desc, unit="queries") as pbar:
             for future in as_completed(futures):
+                result = future.result()
                 if not warmup:
-                    latencies.append(future.result())
+                    latencies.append(result)
                 pbar.update(1)
 
     return latencies
@@ -262,20 +263,6 @@ def compute_statistics(latencies: List[float]) -> Dict[str, float]:
         "p95": np.percentile(arr, 95),
         "p99": np.percentile(arr, 99),
     }
-
-
-def compute_throughput(latencies: List[float]) -> float:
-    """
-    Compute throughput as queries per second.
-
-    Args:
-        latencies: List of query latencies in seconds
-
-    Returns:
-        Queries per second
-    """
-    return len(latencies) / sum(latencies)
-
 
 # ==================== MAIN ====================
 
@@ -352,7 +339,9 @@ def main():
     print("Step 5: Timed Phase")
     print("=" * 60)
     print(f"\nExecuting {NUM_QUERIES:,} queries...")
+    start = time.perf_counter()
     latencies = run_queries(datasets, queries, assignments, NUM_WORKERS, warmup=False)
+    elapsed = time.perf_counter() - start
 
     # Step 7: Compute and display results
     print("\n" + "=" * 60)
@@ -360,7 +349,7 @@ def main():
     print("=" * 60)
 
     stats = compute_statistics(latencies)
-    throughput = compute_throughput(latencies)
+    throughput = NUM_QUERIES / elapsed
 
     print("\nLatency Statistics (seconds):")
     print(f"  Mean:   {stats['mean']:.6f}")
