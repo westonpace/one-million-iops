@@ -10,6 +10,8 @@ Benchmarks Lance vector search performance with:
 - ThreadPoolExecutor with 8 workers for concurrent execution
 """
 
+import ctypes
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Dict
@@ -139,6 +141,70 @@ def create_index(dataset: lance.LanceDataset) -> None:
         num_sub_vectors=NUM_SUB_VECTORS,
         metric="L2",
     )
+
+
+# ==================== CACHE MANAGEMENT ====================
+
+
+def drop_file_cache(file_path: str) -> None:
+    """
+    Drop a file from the kernel page cache using posix_fadvise.
+
+    Args:
+        file_path: Path to the file
+    """
+    POSIX_FADV_DONTNEED = 4
+
+    try:
+        # Open file and get file descriptor
+        fd = os.open(file_path, os.O_RDONLY)
+        try:
+            # Get file size
+            file_size = os.fstat(fd).st_size
+
+            # Call posix_fadvise to drop cache
+            # posix_fadvise(fd, offset, len, advice)
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            result = libc.posix_fadvise(fd, 0, file_size, POSIX_FADV_DONTNEED)
+
+            if result != 0:
+                print(f"    Warning: fadvise failed for {file_path}: errno {result}")
+        finally:
+            os.close(fd)
+    except Exception as e:
+        print(f"    Warning: Could not drop cache for {file_path}: {e}")
+
+
+def drop_dataset_cache(dataset_uri: str) -> None:
+    """
+    Drop all dataset files from kernel page cache.
+
+    Args:
+        dataset_uri: URI of the dataset (may include scheme like file+uring://)
+    """
+    # Strip the URI scheme to get the actual file path
+    if "://" in dataset_uri:
+        path = dataset_uri.split("://", 1)[1]
+    else:
+        path = dataset_uri
+
+    if not os.path.exists(path):
+        print(f"    Warning: Dataset path does not exist: {path}")
+        return
+
+    # Walk through all files in the dataset directory
+    file_count = 0
+    total_size = 0
+
+    for root, dirs, files in os.walk(path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            file_size = os.path.getsize(file_path)
+            drop_file_cache(file_path)
+            file_count += 1
+            total_size += file_size
+
+    print(f"    Dropped {file_count} files ({total_size / 1024**3:.2f} GB) from cache")
 
 
 # ==================== QUERY GENERATION ====================
@@ -334,16 +400,25 @@ def main():
     print(f"\nExecuting {NUM_QUERIES:,} queries...")
     run_queries(datasets, queries, assignments, NUM_WORKERS, warmup=True)
 
-    # Step 6: Timed phase
+    # Step 6: Drop cache
     print("\n" + "=" * 60)
-    print("Step 5: Timed Phase")
+    print("Step 5: Dropping Page Cache")
+    print("=" * 60)
+    print("\nDropping dataset files from kernel page cache...")
+    for i, path in enumerate(DATASET_PATHS, 1):
+        print(f"\n  Dataset {i}/{NUM_DATASETS}: {path}")
+        drop_dataset_cache(path)
+
+    # Step 7: Timed phase
+    print("\n" + "=" * 60)
+    print("Step 6: Timed Phase")
     print("=" * 60)
     print(f"\nExecuting {NUM_QUERIES:,} queries...")
     start = time.perf_counter()
     latencies = run_queries(datasets, queries, assignments, NUM_WORKERS, warmup=False)
     elapsed = time.perf_counter() - start
 
-    # Step 7: Compute and display results
+    # Step 8: Compute and display results
     print("\n" + "=" * 60)
     print("BENCHMARK RESULTS")
     print("=" * 60)
