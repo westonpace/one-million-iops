@@ -51,6 +51,43 @@ QUERY_REFINE_FACTOR = 10
 # ==================== DATASET GENERATION ====================
 
 
+def dataset_exists(uri: str, expected_rows: int = ROWS_PER_DATASET) -> bool:
+    """
+    Check if a dataset exists and has the expected number of rows.
+
+    Args:
+        uri: Path to the dataset
+        expected_rows: Expected number of rows
+
+    Returns:
+        True if dataset exists with correct number of rows, False otherwise
+    """
+    try:
+        ds = lance.dataset(uri)
+        row_count = ds.count_rows()
+        return row_count == expected_rows
+    except Exception:
+        return False
+
+
+def has_vector_index(dataset: lance.LanceDataset, column: str = "vector") -> bool:
+    """
+    Check if a dataset has a vector index on the specified column.
+
+    Args:
+        dataset: LanceDataset to check
+        column: Column name to check for index
+
+    Returns:
+        True if index exists, False otherwise
+    """
+    try:
+        indices = dataset.list_indices()
+        return any(idx["columns"] == [column] for idx in indices)
+    except Exception:
+        return False
+
+
 def generate_dataset(
     uri: str, num_rows: int = ROWS_PER_DATASET, dim: int = VECTOR_DIM
 ) -> lance.LanceDataset:
@@ -262,26 +299,35 @@ def main():
 
     # Step 1: Create datasets
     print("\n" + "=" * 60)
-    print("Step 1: Creating Datasets")
+    print("Step 1: Loading/Creating Datasets")
     print("=" * 60)
 
     datasets = []
     for i, path in enumerate(DATASET_PATHS, 1):
         print(f"\nDataset {i}/{NUM_DATASETS}: {path}")
-        ds = generate_dataset(path)
+        if dataset_exists(path, ROWS_PER_DATASET):
+            print(f"  Dataset exists with {ROWS_PER_DATASET:,} rows - loading")
+            ds = lance.dataset(path)
+        else:
+            print(f"  Dataset not found or has wrong row count - creating")
+            ds = generate_dataset(path)
         datasets.append(ds)
 
     # Step 2: Create indices
     print("\n" + "=" * 60)
-    print("Step 2: Creating Indices")
+    print("Step 2: Loading/Creating Indices")
     print("=" * 60)
 
     for i, ds in enumerate(datasets, 1):
-        print(f"\nCreating index {i}/{NUM_DATASETS}...")
-        start = time.perf_counter()
-        create_index(ds)
-        elapsed = time.perf_counter() - start
-        print(f"  Done in {elapsed:.1f}s")
+        print(f"\nIndex {i}/{NUM_DATASETS}...")
+        if has_vector_index(ds, "vector"):
+            print(f"  Vector index already exists - skipping")
+        else:
+            print(f"  Creating vector index...")
+            start = time.perf_counter()
+            create_index(ds)
+            elapsed = time.perf_counter() - start
+            print(f"  Done in {elapsed:.1f}s")
 
     # Step 3: Generate queries
     print("\n" + "=" * 60)
