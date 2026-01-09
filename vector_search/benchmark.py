@@ -310,7 +310,7 @@ def main():
             print(f"  Dataset exists with {ROWS_PER_DATASET:,} rows - loading")
             ds = lance.dataset(path)
         else:
-            print(f"  Dataset not found or has wrong row count - creating")
+            print("  Dataset not found or has wrong row count - creating")
             ds = generate_dataset(path)
         datasets.append(ds)
 
@@ -321,10 +321,10 @@ def main():
 
     for i, ds in enumerate(datasets, 1):
         print(f"\nIndex {i}/{NUM_DATASETS}...")
-        if has_vector_index(ds, "vector"):
-            print(f"  Vector index already exists - skipping")
+        if has_vector_index(ds):
+            print("  Vector index already exists - skipping")
         else:
-            print(f"  Creating vector index...")
+            print("  Creating vector index...")
             start = time.perf_counter()
             create_index(ds)
             elapsed = time.perf_counter() - start
