@@ -70,20 +70,21 @@ def dataset_exists(uri: str, expected_rows: int = ROWS_PER_DATASET) -> bool:
         return False
 
 
-def has_vector_index(dataset: lance.LanceDataset, column: str = "vector") -> bool:
+def has_vector_index(
+    dataset: lance.LanceDataset,
+) -> bool:
     """
-    Check if a dataset has a vector index on the specified column.
+    Check if a dataset has an index already created.
 
     Args:
         dataset: LanceDataset to check
-        column: Column name to check for index
 
     Returns:
-        True if index exists, False otherwise
+        True if an index already exists, False otherwise
     """
     try:
         indices = dataset.list_indices()
-        return any(idx["columns"] == [column] for idx in indices)
+        return len(indices) > 0
     except Exception:
         return False
 
