@@ -6,7 +6,7 @@ Benchmarks Lance vector search performance with:
 - 3 datasets with 1M rows each
 - 768-dimensional float32 vectors
 - IVF_PQ index with 256 partitions and 48 subvectors
-- 2M total queries (1M warmup + 1M timed)
+- 2,000 queries
 - ThreadPoolExecutor with 8 workers for concurrent execution
 """
 
@@ -39,9 +39,7 @@ NUM_PARTITIONS = 256
 NUM_SUB_VECTORS = 48  # 768 / 48 = 16 dimensions per subvector
 
 # Query parameters
-TOTAL_QUERIES = 2_000_000  # 1M warmup + 1M timed
-WARMUP_QUERIES = 1_000_000
-TIMED_QUERIES = 1_000_000
+NUM_QUERIES = 2000
 NUM_WORKERS = 8
 
 # Query search parameters
@@ -52,8 +50,10 @@ QUERY_REFINE_FACTOR = 10
 
 # ==================== DATASET GENERATION ====================
 
-def generate_dataset(uri: str, num_rows: int = ROWS_PER_DATASET,
-                     dim: int = VECTOR_DIM) -> lance.LanceDataset:
+
+def generate_dataset(
+    uri: str, num_rows: int = ROWS_PER_DATASET, dim: int = VECTOR_DIM
+) -> lance.LanceDataset:
     """
     Generate a Lance dataset with random vectors in batches.
 
@@ -74,8 +74,7 @@ def generate_dataset(uri: str, num_rows: int = ROWS_PER_DATASET,
 
         # Create PyArrow FixedSizeListArray
         arr = pa.FixedSizeListArray.from_arrays(
-            pa.array(vectors.ravel(), type=pa.float32()),
-            list_size=dim
+            pa.array(vectors.ravel(), type=pa.float32()), list_size=dim
         )
 
         # Create table with single vector column
@@ -100,14 +99,16 @@ def create_index(dataset: lance.LanceDataset) -> None:
         index_type="IVF_PQ",
         num_partitions=NUM_PARTITIONS,
         num_sub_vectors=NUM_SUB_VECTORS,
-        metric="L2"
+        metric="L2",
     )
 
 
 # ==================== QUERY GENERATION ====================
 
-def generate_queries(num_queries: int = TOTAL_QUERIES,
-                     dim: int = VECTOR_DIM) -> np.ndarray:
+
+def generate_queries(
+    num_queries: int = NUM_QUERIES, dim: int = VECTOR_DIM
+) -> np.ndarray:
     """
     Generate random query vectors.
 
@@ -128,8 +129,10 @@ def generate_queries(num_queries: int = TOTAL_QUERIES,
 
 # ==================== QUERY EXECUTION ====================
 
-def execute_query(dataset_idx: int, query_vector: np.ndarray,
-                  datasets: List[lance.LanceDataset]) -> float:
+
+def execute_query(
+    dataset_idx: int, query_vector: np.ndarray, datasets: List[lance.LanceDataset]
+) -> float:
     """
     Execute a single vector search query and return latency.
 
@@ -149,18 +152,20 @@ def execute_query(dataset_idx: int, query_vector: np.ndarray,
             "q": query_vector,
             "k": QUERY_K,
             "nprobes": QUERY_NPROBES,
-            "refine_factor": QUERY_REFINE_FACTOR
+            "refine_factor": QUERY_REFINE_FACTOR,
         }
     )
 
     return time.perf_counter() - start
 
 
-def run_queries(datasets: List[lance.LanceDataset],
-                queries: np.ndarray,
-                assignments: List[Tuple[int, int]],
-                num_workers: int = NUM_WORKERS,
-                warmup: bool = False) -> List[float]:
+def run_queries(
+    datasets: List[lance.LanceDataset],
+    queries: np.ndarray,
+    assignments: List[Tuple[int, int]],
+    num_workers: int = NUM_WORKERS,
+    warmup: bool = False,
+) -> List[float]:
     """
     Execute queries concurrently using ThreadPoolExecutor.
 
@@ -182,10 +187,7 @@ def run_queries(datasets: List[lance.LanceDataset],
         futures = []
         for dataset_idx, query_idx in assignments:
             future = executor.submit(
-                execute_query,
-                dataset_idx,
-                queries[query_idx],
-                datasets
+                execute_query, dataset_idx, queries[query_idx], datasets
             )
             futures.append(future)
 
@@ -200,6 +202,7 @@ def run_queries(datasets: List[lance.LanceDataset],
 
 
 # ==================== STATISTICS ====================
+
 
 def compute_statistics(latencies: List[float]) -> Dict[str, float]:
     """
@@ -219,7 +222,7 @@ def compute_statistics(latencies: List[float]) -> Dict[str, float]:
         "max": np.max(arr),
         "p50": np.percentile(arr, 50),
         "p95": np.percentile(arr, 95),
-        "p99": np.percentile(arr, 99)
+        "p99": np.percentile(arr, 99),
     }
 
 
@@ -238,18 +241,23 @@ def compute_throughput(latencies: List[float]) -> float:
 
 # ==================== MAIN ====================
 
+
 def main():
     """Main benchmark orchestration."""
     print("=" * 60)
     print("Lance Vector Search Benchmark")
     print("=" * 60)
-    print(f"\nConfiguration:")
+    print("\nConfiguration:")
     print(f"  Datasets: {NUM_DATASETS}")
     print(f"  Rows per dataset: {ROWS_PER_DATASET:,}")
     print(f"  Vector dimensions: {VECTOR_DIM}")
-    print(f"  Index: IVF_PQ (partitions={NUM_PARTITIONS}, subvectors={NUM_SUB_VECTORS})")
-    print(f"  Total queries: {TOTAL_QUERIES:,} (warmup={WARMUP_QUERIES:,}, timed={TIMED_QUERIES:,})")
-    print(f"  Query parameters: k={QUERY_K}, nprobes={QUERY_NPROBES}, refine_factor={QUERY_REFINE_FACTOR}")
+    print(
+        f"  Index: IVF_PQ (partitions={NUM_PARTITIONS}, subvectors={NUM_SUB_VECTORS})"
+    )
+    print(f"  Num queries: {NUM_QUERIES:,} ")
+    print(
+        f"  Query parameters: k={QUERY_K}, nprobes={QUERY_NPROBES}, refine_factor={QUERY_REFINE_FACTOR}"
+    )
     print(f"  Worker threads: {NUM_WORKERS}")
 
     # Step 1: Create datasets
@@ -283,24 +291,21 @@ def main():
 
     # Step 4: Create query assignments (round-robin distribution)
     print("\nCreating query assignments...")
-    warmup_assignments = [(i % NUM_DATASETS, i) for i in range(WARMUP_QUERIES)]
-    timed_assignments = [(i % NUM_DATASETS, WARMUP_QUERIES + i) for i in range(TIMED_QUERIES)]
-    print(f"  Each dataset will receive ~{WARMUP_QUERIES // NUM_DATASETS:,} warmup queries")
-    print(f"  Each dataset will receive ~{TIMED_QUERIES // NUM_DATASETS:,} timed queries")
+    assignments = [(i % NUM_DATASETS, i) for i in range(NUM_QUERIES)]
 
     # Step 5: Warmup phase
     print("\n" + "=" * 60)
     print("Step 4: Warmup Phase")
     print("=" * 60)
-    print(f"\nExecuting {WARMUP_QUERIES:,} warmup queries...")
-    run_queries(datasets, queries, warmup_assignments, NUM_WORKERS, warmup=True)
+    print(f"\nExecuting {NUM_QUERIES:,} queries...")
+    run_queries(datasets, queries, assignments, NUM_WORKERS, warmup=True)
 
     # Step 6: Timed phase
     print("\n" + "=" * 60)
     print("Step 5: Timed Phase")
     print("=" * 60)
-    print(f"\nExecuting {TIMED_QUERIES:,} timed queries...")
-    latencies = run_queries(datasets, queries, timed_assignments, NUM_WORKERS, warmup=False)
+    print(f"\nExecuting {NUM_QUERIES:,} queries...")
+    latencies = run_queries(datasets, queries, assignments, NUM_WORKERS, warmup=False)
 
     # Step 7: Compute and display results
     print("\n" + "=" * 60)
