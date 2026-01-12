@@ -39,10 +39,27 @@ uv run benchmark.py
 
 ### Customizing Dataset Paths
 
-Edit the `DATASET_PATHS` constant at the top of `benchmark.py`:
+**Option 1: Environment Variable (Recommended)**
+
+Set the `DATASET_PATHS` environment variable with comma-separated paths:
+
+```bash
+export DATASET_PATHS="./lance_dataset_0,./lance_dataset_1,./lance_dataset_2"
+uv run benchmark.py
+```
+
+Or inline:
+
+```bash
+DATASET_PATHS="path1,path2,path3" uv run benchmark.py
+```
+
+**Option 2: Edit the Script**
+
+Edit the `_DEFAULT_DATASET_PATHS` constant at the top of `benchmark.py`:
 
 ```python
-DATASET_PATHS = [
+_DEFAULT_DATASET_PATHS = [
     "./lance_dataset_0",
     "./lance_dataset_1",
     "./lance_dataset_2",

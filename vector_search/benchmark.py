@@ -23,15 +23,23 @@ from tqdm import tqdm
 
 # ==================== CONFIGURATION ====================
 
-# Edit these paths as needed
-DATASET_PATHS = [
+# Edit these paths as needed, or set DATASET_PATHS environment variable
+# Environment variable should be comma-separated paths, e.g.:
+# DATASET_PATHS="path1,path2,path3"
+_DEFAULT_DATASET_PATHS = [
     "file+uring:///var/data/one/dataset.lance",
     "file+uring:///var/data/two/dataset.lance",
     "file+uring:///var/data/three/dataset.lance",
 ]
 
+# Override with environment variable if set
+if os.getenv("DATASET_PATHS"):
+    DATASET_PATHS = [path.strip() for path in os.getenv("DATASET_PATHS").split(",")]
+else:
+    DATASET_PATHS = _DEFAULT_DATASET_PATHS
+
 # Dataset parameters
-NUM_DATASETS = 3
+NUM_DATASETS = len(DATASET_PATHS)
 ROWS_PER_DATASET = 1_000_000
 VECTOR_DIM = 768
 BATCH_SIZE = 100_000  # For memory-efficient dataset generation
@@ -41,12 +49,12 @@ NUM_PARTITIONS = 256
 NUM_SUB_VECTORS = 48  # 768 / 48 = 16 dimensions per subvector
 
 # Query parameters
-NUM_QUERIES = 20000
-NUM_WORKERS = 256
+NUM_QUERIES = 10000
+NUM_WORKERS = 32
 
 # Query search parameters
 QUERY_K = 50  # Top K results
-QUERY_NPROBES = 20
+QUERY_NPROBES = 1
 QUERY_REFINE_FACTOR = 10
 
 
@@ -122,7 +130,7 @@ def generate_dataset(
 
         # Write batch (create on first, append on subsequent)
         mode = "create" if i == 0 else "append"
-        lance.write_dataset(table, uri, mode=mode)
+        lance.write_dataset(table, uri, mode=mode, data_storage_version="2.1")
 
     return lance.dataset(uri)
 
@@ -235,7 +243,10 @@ def generate_queries(
 
 
 def execute_query(
-    dataset_idx: int, query_vector: np.ndarray, datasets: List[lance.LanceDataset]
+    dataset_idx: int,
+    query_vector: np.ndarray,
+    datasets: List[lance.LanceDataset],
+    counter: int,
 ) -> float:
     """
     Execute a single vector search query and return latency.
@@ -248,6 +259,9 @@ def execute_query(
     Returns:
         Query latency in seconds
     """
+    if counter % 1000 == 0:
+        print(f"  Executing query {counter:,}")
+
     start = time.perf_counter()
 
     datasets[dataset_idx].to_table(
@@ -289,11 +303,13 @@ def run_queries(
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         # Submit all queries
         futures = []
+        counter = 0
         for dataset_idx, query_idx in assignments:
             future = executor.submit(
-                execute_query, dataset_idx, queries[query_idx], datasets
+                execute_query, dataset_idx, queries[query_idx], datasets, counter
             )
             futures.append(future)
+            counter += 1
 
         # Collect results with progress bar
         with tqdm(total=len(futures), desc=desc, unit="queries") as pbar:
@@ -329,6 +345,7 @@ def compute_statistics(latencies: List[float]) -> Dict[str, float]:
         "p95": np.percentile(arr, 95),
         "p99": np.percentile(arr, 99),
     }
+
 
 # ==================== MAIN ====================
 

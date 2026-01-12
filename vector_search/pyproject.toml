@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "Lance vector search benchmark with concurrent query execution"
 requires-python = ">=3.9"
 dependencies = [
-    "pylance>=0.19.0",
     "numpy>=1.22.0",
     "pyarrow>=14.0.0",
     "tqdm>=4.65.0",
