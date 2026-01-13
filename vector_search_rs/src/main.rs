@@ -324,13 +324,14 @@ fn run_queries(
                             let result = execute_query(dataset, query).await;
                             pb.inc(1);
 
-                            if !warmup {
-                                if let Ok(latency) = result {
-                                    latencies.lock().unwrap().push(latency);
-                                }
-                            }
+                            let latency = result.unwrap_or_else(|e| {
+                                eprintln!("Query failed in thread {}: {:?}", thread_idx, e);
+                                0.0f64
+                            });
 
-                            result
+                            if !warmup {
+                                latencies.lock().unwrap().push(latency);
+                            }
                         })
                     })
                     .buffer_unordered(CONCURRENT_QUERIES);
