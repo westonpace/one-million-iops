@@ -6418,6 +6418,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
+ "crossbeam-channel",
  "env_logger",
  "futures",
  "indicatif",

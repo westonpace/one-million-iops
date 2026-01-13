@@ -23,6 +23,7 @@ anyhow = "1.0"
 walkdir = "2.0"
 libc = "0.2"
 jemallocator = "0.5"
+crossbeam-channel = "0.5"
 
 [profile.release]
 opt-level = 3

@@ -5,12 +5,13 @@
 //! - 768-dimensional float32 vectors
 //! - IVF_PQ index with 256 partitions and 48 subvectors
 //! - 10,000 queries
-//! - Multiple thread-locked current-thread runtimes
+//! - Multiple thread-locked current-thread runtimes with MPMC queue
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use arrow::array::{FixedSizeListArray, Float32Array, RecordBatchIterator};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use crossbeam_channel::{bounded, Receiver, Sender};
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
@@ -45,7 +46,7 @@ const NUM_SUB_VECTORS: usize = 48;
 // Query parameters
 const NUM_QUERIES: usize = 2_000;
 const NUM_RUNTIMES: usize = 16;
-const CONCURRENT_QUERIES: usize = 128;
+const CONCURRENT_QUERIES: usize = 4;
 const QUERY_K: usize = 50;
 const QUERY_NPROBES: usize = 1;
 const QUERY_REFINE_FACTOR: u32 = 10;
@@ -83,6 +84,7 @@ async fn generate_dataset(uri: &str, num_rows: usize, dim: usize) -> Result<Data
     println!("\nGenerating dataset: {}", uri);
 
     let num_batches = num_rows / BATCH_SIZE;
+    assert!(num_batches > 0, "Number of batches must be greater than 0");
     let pb = ProgressBar::new(num_batches as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -99,15 +101,15 @@ async fn generate_dataset(uri: &str, num_rows: usize, dim: usize) -> Result<Data
         true,
     )]));
 
-    let mut rng = rand::thread_rng();
+    let schema_clone = schema.clone();
+    let pb_clone = pb.clone();
 
-    for i in 0..num_batches {
-        // Generate random vectors
+    let batches = (0..num_batches).map(move |_| {
+        let mut rng = rand::thread_rng();
         let mut values: Vec<f32> = Vec::with_capacity(BATCH_SIZE * dim);
         for _ in 0..BATCH_SIZE * dim {
             values.push(StandardNormal.sample(&mut rng));
         }
-
         let values_array = Float32Array::from(values);
         let list_array = FixedSizeListArray::new(
             Arc::new(Field::new("item", DataType::Float32, true)),
@@ -115,28 +117,22 @@ async fn generate_dataset(uri: &str, num_rows: usize, dim: usize) -> Result<Data
             Arc::new(values_array),
             None,
         );
-
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list_array)])?;
-
-        let mode = if i == 0 {
-            WriteMode::Create
-        } else {
-            WriteMode::Append
-        };
-
-        let params = WriteParams {
-            mode,
-            ..Default::default()
-        };
-
-        let batches = vec![Ok(batch)];
-        let reader = RecordBatchIterator::new(batches.into_iter(), schema.clone());
-        Dataset::write(reader, uri, Some(params)).await?;
         pb.inc(1);
-    }
 
-    pb.finish();
-    Dataset::open(uri).await.context("Failed to open dataset")
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(list_array)])
+    });
+
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        max_rows_per_file: ROWS_PER_DATASET,
+        ..Default::default()
+    };
+
+    let reader = RecordBatchIterator::new(batches, schema_clone);
+    let dataset = Dataset::write(reader, uri, Some(params)).await?;
+    pb_clone.finish();
+
+    Ok(dataset)
 }
 
 // ==================== INDEX CREATION ====================
@@ -267,6 +263,9 @@ async fn execute_query(dataset: Arc<Dataset>, query_vector: Vec<f32>) -> Result<
     Ok(start.elapsed().as_secs_f64())
 }
 
+// Query task: (dataset_idx, query_vector)
+type QueryTask = (usize, Vec<f32>);
+
 fn run_queries(
     datasets: Vec<Arc<Dataset>>,
     queries: Vec<Vec<f32>>,
@@ -285,121 +284,83 @@ fn run_queries(
     );
 
     let num_datasets = datasets.len();
-    let queries_per_runtime = (queries.len() + NUM_RUNTIMES - 1) / NUM_RUNTIMES;
 
-    // Divide queries among runtimes
-    let query_chunks: Vec<Vec<(usize, Vec<f32>)>> = (0..NUM_RUNTIMES)
-        .map(|runtime_idx| {
-            let start = runtime_idx * queries_per_runtime;
-            let end = ((runtime_idx + 1) * queries_per_runtime).min(queries.len());
+    // Create MPMC channel for query tasks
+    let (tx, rx): (Sender<QueryTask>, Receiver<QueryTask>) = bounded(queries.len());
 
-            queries[start..end]
-                .iter()
-                .enumerate()
-                .map(|(local_idx, query)| {
-                    let global_idx = start + local_idx;
-                    let dataset_idx = global_idx % num_datasets;
-                    (dataset_idx, query.clone())
-                })
-                .collect()
-        })
-        .collect();
+    // Send all queries to the channel
+    for (i, query) in queries.into_iter().enumerate() {
+        let dataset_idx = i % num_datasets;
+        tx.send((dataset_idx, query))?;
+    }
+    drop(tx); // Close the sender so threads know when to stop
 
-    // Spawn threads, each with its own current-thread runtime
+    // Spawn worker threads
     let mut handles = Vec::new();
+    let latencies = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    for (runtime_idx, chunk) in query_chunks.into_iter().enumerate() {
-        let name = if warmup {
-            format!("warmup-{}", runtime_idx)
-        } else {
-            format!("timed-{}", runtime_idx)
-        };
-
-        println!(
-            "Running queries: runtime_idx={}, chunk={:?}",
-            runtime_idx,
-            chunk.len()
-        );
-
-        if chunk.is_empty() {
-            continue;
-        }
-
+    for thread_idx in 0..NUM_RUNTIMES {
+        let rx = rx.clone();
         let datasets = datasets.clone();
         let pb = pb.clone();
+        let latencies = latencies.clone();
 
         let handle = std::thread::spawn(move || {
             // Create a current-thread runtime for this thread
             let rt = tokio::runtime::Builder::new_current_thread()
-                .thread_name(name)
-                .max_blocking_threads(1)
+                .enable_all()
                 .build()
                 .unwrap();
 
-            let mut latencies = Vec::new();
-
-            // Run all queries for this runtime with concurrency control
-            rt.block_on(async {
-                // Create tasks for all queries in this chunk
-                // Execute tasks with concurrency limit
-                let results = stream::iter(chunk)
+            rt.block_on(async move {
+                // Process queries from the queue with concurrency control
+                let query_stream = stream::iter(std::iter::from_fn(|| rx.recv().ok()))
                     .map(|(dataset_idx, query)| {
                         let dataset = datasets[dataset_idx].clone();
                         let pb = pb.clone();
+                        let latencies = latencies.clone();
+
                         tokio::task::spawn(async move {
                             let result = execute_query(dataset, query).await;
                             pb.inc(1);
+
+                            if !warmup {
+                                if let Ok(latency) = result {
+                                    latencies.lock().unwrap().push(latency);
+                                }
+                            }
+
                             result
                         })
                     })
-                    .buffer_unordered(CONCURRENT_QUERIES)
-                    .collect::<Vec<_>>()
-                    .await;
+                    .buffer_unordered(CONCURRENT_QUERIES);
 
-                // Collect successful results
-                if !warmup {
-                    for result in results {
-                        match result {
-                            Ok(Ok(latency)) => latencies.push(latency),
-                            Ok(Err(e)) => {
-                                eprintln!("Query failed in runtime {}: {}", runtime_idx, e)
-                            }
-                            Err(e) => eprintln!("Task panicked in runtime {}: {}", runtime_idx, e),
+                // Collect all results
+                query_stream
+                    .for_each(|result| async {
+                        if let Err(e) = result {
+                            eprintln!("Query failed in thread {}: {:?}", thread_idx, e);
                         }
-                    }
-                }
+                    })
+                    .await;
             });
-
-            println!(
-                "Finished runtime {}: {} queries",
-                runtime_idx,
-                latencies.len()
-            );
-
-            latencies
         });
 
         handles.push(handle);
     }
 
-    // Collect results from all threads
-    let mut all_latencies = Vec::new();
-    if !warmup {
-        for handle in handles {
-            let latencies = handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("Thread panicked"))?;
-            all_latencies.extend(latencies);
-        }
-    } else {
-        for handle in handles {
-            let _ = handle.join();
-        }
+    // Wait for all threads to complete
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("Thread panicked"))?;
     }
 
     pb.finish();
 
-    Ok(all_latencies)
+    let latencies = Arc::try_unwrap(latencies).unwrap().into_inner().unwrap();
+
+    Ok(latencies)
 }
 
 // ==================== STATISTICS ====================
@@ -447,7 +408,7 @@ fn main() -> Result<()> {
     env_logger::init();
 
     // Create a single-threaded runtime for setup phase
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let setup_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 
@@ -472,12 +433,13 @@ fn main() -> Result<()> {
 
     let dataset_paths = get_dataset_paths();
 
-    // Step 1: Create datasets
-    println!("\n{}", "=".repeat(60));
-    println!("Step 1: Loading/Creating Datasets");
-    println!("{}", "=".repeat(60));
+    // Step 1 & 2: Create datasets and indices (using setup runtime)
+    let datasets = setup_rt.block_on(async {
+        // Step 1: Create datasets
+        println!("\n{}", "=".repeat(60));
+        println!("Step 1: Loading/Creating Datasets");
+        println!("{}", "=".repeat(60));
 
-    let datasets = rt.block_on(async {
         let mut datasets_mut = Vec::new();
         for (i, path) in dataset_paths.iter().enumerate() {
             println!("\nDataset {}/{}: {}", i + 1, NUM_DATASETS, path);
