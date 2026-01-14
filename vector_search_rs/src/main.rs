@@ -24,6 +24,7 @@ use rand_distr::{Distribution, StandardNormal};
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -244,6 +245,8 @@ fn generate_queries(num_queries: usize, dim: usize) -> Vec<Vec<f32>> {
     queries
 }
 
+static ROW_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 // ==================== QUERY EXECUTION ====================
 
 async fn execute_query(dataset: Arc<Dataset>, query_vector: Vec<f32>) -> Result<f64> {
@@ -252,13 +255,15 @@ async fn execute_query(dataset: Arc<Dataset>, query_vector: Vec<f32>) -> Result<
     // Convert vector to Arrow array
     let query_array = Float32Array::from(query_vector);
 
-    let _ = dataset
+    let batch = dataset
         .scan()
         .nearest("vector", &query_array, QUERY_K)?
         .nprobes(QUERY_NPROBES)
         .refine(QUERY_REFINE_FACTOR)
         .try_into_batch()
         .await?;
+
+    ROW_COUNTER.fetch_add(batch.num_rows(), std::sync::atomic::Ordering::Relaxed);
 
     Ok(start.elapsed().as_secs_f64())
 }
@@ -534,6 +539,11 @@ fn main() -> Result<()> {
     println!("\n{}", "=".repeat(60));
     println!("Benchmark Complete!");
     println!("{}", "=".repeat(60));
+
+    println!(
+        "  Total rows scanned: {}",
+        ROW_COUNTER.load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     Ok(())
 }
