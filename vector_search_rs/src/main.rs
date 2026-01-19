@@ -490,7 +490,11 @@ fn main() -> Result<()> {
 
         tracing_subscriber::registry()
             .with(filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(non_blocking))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(non_blocking),
+            )
             .init();
 
         Some(guard)
