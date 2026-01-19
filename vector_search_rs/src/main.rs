@@ -1,16 +1,10 @@
 //! Lance Vector Search Benchmark
-//!
-//! Benchmarks Lance vector search performance with:
-//! - 3 datasets with 1M rows each
-//! - 768-dimensional float32 vectors
-//! - IVF_PQ index with 256 partitions and 48 subvectors
-//! - 10,000 queries
-//! - Multiple thread-locked current-thread runtimes with MPMC queue
 
 use anyhow::Result;
 use arrow::array::{FixedSizeListArray, Float32Array, RecordBatchIterator};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -21,7 +15,6 @@ use lance_index::vector::pq::PQBuildParams;
 use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::MetricType;
 use rand_distr::{Distribution, StandardNormal};
-use std::env;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::AtomicUsize;
@@ -35,33 +28,72 @@ static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 // ==================== CONFIGURATION ====================
 
-const NUM_DATASETS: usize = 3;
-const ROWS_PER_DATASET: usize = 1_000_000;
-const VECTOR_DIM: usize = 768;
-const BATCH_SIZE: usize = 100_000;
+#[derive(Parser, Debug, Clone)]
+#[command(name = "vector-search-benchmark")]
+#[command(about = "Lance Vector Search Benchmark", long_about = None)]
+struct Args {
+    /// Dataset paths (comma-separated or multiple -d flags)
+    #[arg(short = 'd', long = "dataset", value_delimiter = ',')]
+    datasets: Option<Vec<String>>,
 
-// Index parameters
-const NUM_PARTITIONS: usize = 256;
-const NUM_SUB_VECTORS: usize = 48;
+    /// Number of datasets to create/use (only used if --dataset not specified)
+    #[arg(long, default_value_t = 3)]
+    num_datasets: usize,
 
-// Query parameters
-const NUM_QUERIES: usize = 2_000;
-const NUM_RUNTIMES: usize = 16;
-const CONCURRENT_QUERIES: usize = 4;
-const QUERY_K: usize = 50;
-const QUERY_NPROBES: usize = 1;
-const QUERY_REFINE_FACTOR: u32 = 10;
+    /// Rows per dataset
+    #[arg(long, default_value_t = 1_000_000)]
+    rows_per_dataset: usize,
 
-// Default dataset paths
-fn get_dataset_paths() -> Vec<String> {
-    if let Ok(paths) = env::var("DATASET_PATHS") {
-        paths.split(',').map(|s| s.trim().to_string()).collect()
-    } else {
-        vec![
-            "file+uring:///var/data/one/dataset.lance".to_string(),
-            "file+uring:///var/data/two/dataset.lance".to_string(),
-            "file+uring:///var/data/three/dataset.lance".to_string(),
-        ]
+    /// Vector dimensions
+    #[arg(long, default_value_t = 768)]
+    vector_dim: usize,
+
+    /// Batch size for writing
+    #[arg(long, default_value_t = 100_000)]
+    batch_size: usize,
+
+    /// Number of IVF partitions
+    #[arg(long, default_value_t = 256)]
+    num_partitions: usize,
+
+    /// Number of PQ sub-vectors
+    #[arg(long, default_value_t = 48)]
+    num_sub_vectors: usize,
+
+    /// Number of queries to run
+    #[arg(long, default_value_t = 2_000)]
+    num_queries: usize,
+
+    /// Number of runtime threads
+    #[arg(long, default_value_t = 16)]
+    num_runtimes: usize,
+
+    /// Concurrent queries per runtime
+    #[arg(long, default_value_t = 4)]
+    concurrent_queries: usize,
+
+    /// Top K results to return
+    #[arg(short = 'k', long, default_value_t = 50)]
+    query_k: usize,
+
+    /// Number of probes for IVF search
+    #[arg(long, default_value_t = 1)]
+    nprobes: usize,
+
+    /// Refine factor for PQ search
+    #[arg(long, default_value_t = 10)]
+    refine_factor: u32,
+}
+
+impl Args {
+    fn get_dataset_paths(&self) -> Vec<String> {
+        if let Some(ref paths) = self.datasets {
+            paths.clone()
+        } else {
+            (1..=self.num_datasets)
+                .map(|i| format!("file+uring:///var/data/{}/dataset.lance", i))
+                .collect()
+        }
     }
 }
 
@@ -81,10 +113,15 @@ async fn has_vector_index(dataset: &Dataset) -> Result<bool> {
     Ok(!indices.is_empty())
 }
 
-async fn generate_dataset(uri: &str, num_rows: usize, dim: usize) -> Result<Dataset> {
+async fn generate_dataset(
+    uri: &str,
+    num_rows: usize,
+    dim: usize,
+    batch_size: usize,
+) -> Result<Dataset> {
     println!("\nGenerating dataset: {}", uri);
 
-    let num_batches = num_rows / BATCH_SIZE;
+    let num_batches = num_rows / batch_size;
     assert!(num_batches > 0, "Number of batches must be greater than 0");
     let pb = ProgressBar::new(num_batches as u64);
     pb.set_style(
@@ -107,8 +144,8 @@ async fn generate_dataset(uri: &str, num_rows: usize, dim: usize) -> Result<Data
 
     let batches = (0..num_batches).map(move |_| {
         let mut rng = rand::thread_rng();
-        let mut values: Vec<f32> = Vec::with_capacity(BATCH_SIZE * dim);
-        for _ in 0..BATCH_SIZE * dim {
+        let mut values: Vec<f32> = Vec::with_capacity(batch_size * dim);
+        for _ in 0..batch_size * dim {
             values.push(StandardNormal.sample(&mut rng));
         }
         let values_array = Float32Array::from(values);
@@ -125,7 +162,7 @@ async fn generate_dataset(uri: &str, num_rows: usize, dim: usize) -> Result<Data
 
     let params = WriteParams {
         mode: WriteMode::Create,
-        max_rows_per_file: ROWS_PER_DATASET,
+        max_rows_per_file: num_rows,
         ..Default::default()
     };
 
@@ -138,14 +175,18 @@ async fn generate_dataset(uri: &str, num_rows: usize, dim: usize) -> Result<Data
 
 // ==================== INDEX CREATION ====================
 
-async fn create_index(dataset: &mut Dataset) -> Result<()> {
+async fn create_index(
+    dataset: &mut Dataset,
+    num_partitions: usize,
+    num_sub_vectors: usize,
+) -> Result<()> {
     let ivf_params = IvfBuildParams {
-        num_partitions: Some(NUM_PARTITIONS),
+        num_partitions: Some(num_partitions),
         ..Default::default()
     };
 
     let pq_params = PQBuildParams {
-        num_sub_vectors: NUM_SUB_VECTORS,
+        num_sub_vectors,
         ..Default::default()
     };
 
@@ -249,7 +290,13 @@ static ROW_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 // ==================== QUERY EXECUTION ====================
 
-async fn execute_query(dataset: Arc<Dataset>, query_vector: Vec<f32>) -> Result<f64> {
+async fn execute_query(
+    dataset: Arc<Dataset>,
+    query_vector: Vec<f32>,
+    query_k: usize,
+    nprobes: usize,
+    refine_factor: u32,
+) -> Result<f64> {
     let start = Instant::now();
 
     // Convert vector to Arrow array
@@ -257,9 +304,9 @@ async fn execute_query(dataset: Arc<Dataset>, query_vector: Vec<f32>) -> Result<
 
     let batch = dataset
         .scan()
-        .nearest("vector", &query_array, QUERY_K)?
-        .nprobes(QUERY_NPROBES)
-        .refine(QUERY_REFINE_FACTOR)
+        .nearest("vector", &query_array, query_k)?
+        .nprobes(nprobes)
+        .refine(refine_factor)
         .try_into_batch()
         .await?;
 
@@ -275,6 +322,11 @@ fn run_queries(
     datasets: Vec<Arc<Dataset>>,
     queries: Vec<Vec<f32>>,
     warmup: bool,
+    num_runtimes: usize,
+    concurrent_queries: usize,
+    query_k: usize,
+    nprobes: usize,
+    refine_factor: u32,
 ) -> Result<Vec<f64>> {
     let desc = if warmup {
         "Warmup queries"
@@ -304,7 +356,7 @@ fn run_queries(
     let mut handles = Vec::new();
     let latencies = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    for thread_idx in 0..NUM_RUNTIMES {
+    for thread_idx in 0..num_runtimes {
         let rx = rx.clone();
         let datasets = datasets.clone();
         let pb = pb.clone();
@@ -326,7 +378,9 @@ fn run_queries(
                         let latencies = latencies.clone();
 
                         tokio::task::spawn(async move {
-                            let result = execute_query(dataset, query).await;
+                            let result =
+                                execute_query(dataset, query, query_k, nprobes, refine_factor)
+                                    .await;
                             pb.inc(1);
 
                             let latency = result.unwrap_or_else(|e| {
@@ -339,7 +393,7 @@ fn run_queries(
                             }
                         })
                     })
-                    .buffer_unordered(CONCURRENT_QUERIES);
+                    .buffer_unordered(concurrent_queries);
 
                 // Collect all results
                 query_stream
@@ -413,6 +467,10 @@ fn compute_statistics(latencies: &[f64]) -> Statistics {
 fn main() -> Result<()> {
     env_logger::init();
 
+    let args = Args::parse();
+    let dataset_paths = args.get_dataset_paths();
+    let num_datasets = dataset_paths.len();
+
     // Create a single-threaded runtime for setup phase
     let setup_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -422,22 +480,23 @@ fn main() -> Result<()> {
     println!("Lance Vector Search Benchmark");
     println!("{}", "=".repeat(60));
     println!("\nConfiguration:");
-    println!("  Datasets: {}", NUM_DATASETS);
-    println!("  Rows per dataset: {}", ROWS_PER_DATASET);
-    println!("  Vector dimensions: {}", VECTOR_DIM);
+    println!("  Datasets: {}", num_datasets);
+    println!("  Rows per dataset: {}", args.rows_per_dataset);
+    println!("  Vector dimensions: {}", args.vector_dim);
     println!(
         "  Index: IVF_PQ (partitions={}, subvectors={})",
-        NUM_PARTITIONS, NUM_SUB_VECTORS
+        args.num_partitions, args.num_sub_vectors
     );
-    println!("  Num queries: {}", NUM_QUERIES);
+    println!("  Num queries: {}", args.num_queries);
     println!(
         "  Query parameters: k={}, nprobes={}, refine_factor={}",
-        QUERY_K, QUERY_NPROBES, QUERY_REFINE_FACTOR
+        args.query_k, args.nprobes, args.refine_factor
     );
-    println!("  Number of runtimes: {}", NUM_RUNTIMES);
-    println!("  Concurrent queries per runtime: {}", CONCURRENT_QUERIES);
-
-    let dataset_paths = get_dataset_paths();
+    println!("  Number of runtimes: {}", args.num_runtimes);
+    println!(
+        "  Concurrent queries per runtime: {}",
+        args.concurrent_queries
+    );
 
     // Step 1 & 2: Create datasets and indices (using setup runtime)
     let datasets = setup_rt.block_on(async {
@@ -448,14 +507,23 @@ fn main() -> Result<()> {
 
         let mut datasets_mut = Vec::new();
         for (i, path) in dataset_paths.iter().enumerate() {
-            println!("\nDataset {}/{}: {}", i + 1, NUM_DATASETS, path);
+            println!("\nDataset {}/{}: {}", i + 1, num_datasets, path);
 
-            let dataset = if dataset_exists(path, ROWS_PER_DATASET).await {
-                println!("  Dataset exists with {} rows - loading", ROWS_PER_DATASET);
+            let dataset = if dataset_exists(path, args.rows_per_dataset).await {
+                println!(
+                    "  Dataset exists with {} rows - loading",
+                    args.rows_per_dataset
+                );
                 Dataset::open(path).await?
             } else {
                 println!("  Dataset not found or has wrong row count - creating");
-                generate_dataset(path, ROWS_PER_DATASET, VECTOR_DIM).await?
+                generate_dataset(
+                    path,
+                    args.rows_per_dataset,
+                    args.vector_dim,
+                    args.batch_size,
+                )
+                .await?
             };
 
             datasets_mut.push(dataset);
@@ -467,14 +535,14 @@ fn main() -> Result<()> {
         println!("{}", "=".repeat(60));
 
         for (i, dataset) in datasets_mut.iter_mut().enumerate() {
-            println!("\nIndex {}/{}...", i + 1, NUM_DATASETS);
+            println!("\nIndex {}/{}...", i + 1, num_datasets);
 
             if has_vector_index(dataset).await? {
                 println!("  Vector index already exists - skipping");
             } else {
                 println!("  Creating vector index...");
                 let start = Instant::now();
-                create_index(dataset).await?;
+                create_index(dataset, args.num_partitions, args.num_sub_vectors).await?;
                 let elapsed = start.elapsed();
                 println!("  Done in {:.1}s", elapsed.as_secs_f64());
             }
@@ -489,14 +557,23 @@ fn main() -> Result<()> {
     println!("\n{}", "=".repeat(60));
     println!("Step 3: Generating Queries");
     println!("{}", "=".repeat(60));
-    let queries = generate_queries(NUM_QUERIES, VECTOR_DIM);
+    let queries = generate_queries(args.num_queries, args.vector_dim);
 
     // Step 4: Warmup phase
     println!("\n{}", "=".repeat(60));
     println!("Step 4: Warmup Phase");
     println!("{}", "=".repeat(60));
-    println!("\nExecuting {} queries...", NUM_QUERIES);
-    run_queries(datasets.clone(), queries.clone(), true)?;
+    println!("\nExecuting {} queries...", args.num_queries);
+    run_queries(
+        datasets.clone(),
+        queries.clone(),
+        true,
+        args.num_runtimes,
+        args.concurrent_queries,
+        args.query_k,
+        args.nprobes,
+        args.refine_factor,
+    )?;
 
     // Step 5: Drop cache
     println!("\n{}", "=".repeat(60));
@@ -504,7 +581,7 @@ fn main() -> Result<()> {
     println!("{}", "=".repeat(60));
     println!("\nDropping dataset files from kernel page cache...");
     for (i, path) in dataset_paths.iter().enumerate() {
-        println!("\n  Dataset {}/{}: {}", i + 1, NUM_DATASETS, path);
+        println!("\n  Dataset {}/{}: {}", i + 1, num_datasets, path);
         drop_dataset_cache(path)?;
     }
 
@@ -512,9 +589,18 @@ fn main() -> Result<()> {
     println!("\n{}", "=".repeat(60));
     println!("Step 6: Timed Phase");
     println!("{}", "=".repeat(60));
-    println!("\nExecuting {} queries...", NUM_QUERIES);
+    println!("\nExecuting {} queries...", args.num_queries);
     let start = Instant::now();
-    let latencies = run_queries(datasets, queries, false)?;
+    let latencies = run_queries(
+        datasets,
+        queries,
+        false,
+        args.num_runtimes,
+        args.concurrent_queries,
+        args.query_k,
+        args.nprobes,
+        args.refine_factor,
+    )?;
     let elapsed = start.elapsed();
 
     // Step 7: Compute and display results
@@ -523,7 +609,7 @@ fn main() -> Result<()> {
     println!("{}", "=".repeat(60));
 
     let stats = compute_statistics(&latencies);
-    let throughput = NUM_QUERIES as f64 / elapsed.as_secs_f64();
+    let throughput = args.num_queries as f64 / elapsed.as_secs_f64();
 
     println!("\nLatency Statistics (seconds):");
     println!("  Mean:   {:.6}", stats.mean);
