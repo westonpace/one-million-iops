@@ -20,6 +20,9 @@ use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Instant;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
 extern crate jemallocator;
 
@@ -83,6 +86,10 @@ struct Args {
     /// Refine factor for PQ search
     #[arg(long, default_value_t = 10)]
     refine_factor: u32,
+
+    /// Path to write tracing output (enables lance_io info tracing)
+    #[arg(long)]
+    tracing_output_path: Option<String>,
 }
 
 impl Args {
@@ -465,9 +472,32 @@ fn compute_statistics(latencies: &[f64]) -> Statistics {
 // ==================== MAIN ====================
 
 fn main() -> Result<()> {
-    env_logger::init();
-
     let args = Args::parse();
+
+    // Set up tracing if output path is specified
+    let _guard = if let Some(ref tracing_path) = args.tracing_output_path {
+        let path = Path::new(tracing_path);
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let filename = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "trace.log".to_string());
+
+        let file_appender = tracing_appender::rolling::never(parent, filename);
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+        let filter = EnvFilter::new("lance_io=info");
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(non_blocking))
+            .init();
+
+        Some(guard)
+    } else {
+        env_logger::init();
+        None
+    };
     let dataset_paths = args.get_dataset_paths();
     let num_datasets = dataset_paths.len();
 
