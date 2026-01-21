@@ -10,6 +10,7 @@ use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::index::vector::VectorIndexParams;
+use lance_file::version::LanceFileVersion;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::{DatasetIndexExt, IndexType};
@@ -170,6 +171,7 @@ async fn generate_dataset(
     let params = WriteParams {
         mode: WriteMode::Create,
         max_rows_per_file: num_rows,
+        data_storage_version: Some(LanceFileVersion::V2_1),
         ..Default::default()
     };
 

@@ -6280,6 +6280,7 @@ dependencies = [
  "jemallocator",
  "lance",
  "lance-core",
+ "lance-file",
  "lance-index",
  "lance-io",
  "lance-linalg",

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 lance = { git="https://github.com/westonpace/lance", branch="blog/one-million-iops" }
 lance-core = { git="https://github.com/westonpace/lance", branch="blog/one-million-iops" }
+lance-file = { git="https://github.com/westonpace/lance", branch="blog/one-million-iops" }
 lance-index = { git="https://github.com/westonpace/lance", branch="blog/one-million-iops" }
 lance-io = { git="https://github.com/westonpace/lance", branch="blog/one-million-iops" }
 lance-linalg = { git="https://github.com/westonpace/lance", branch="blog/one-million-iops" }
